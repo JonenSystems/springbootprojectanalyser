@@ -51,6 +51,8 @@ public class ClassDiagramServiceImpl implements ClassDiagramService {
         
         // 依存関係マップの作成
         Map<String, Map<String, List<String>>> dependencyMap = buildDependencyMap(targetClasses, projectId);
+        // 依存関係一覧の作成
+        List<ClassDependencyListItemDto> dependencyList = buildDependencyList(targetClasses, projectId);
         
         // インターフェースクラスのセットを作成（実装関係「001_002」のターゲットになっているクラス）
         Set<String> interfaceClassFqns = identifyInterfaceClasses(targetClasses, projectId);
@@ -77,7 +79,7 @@ public class ClassDiagramServiceImpl implements ClassDiagramService {
         // SPC-201.005-001: クラス図の書式生成
         String classDiagramText = generateMermaidClassDiagram(targetClassList, classMemberMap, dependencyMap, interfaceClassFqns, startClassFqn, endpointUri, httpMethod);
         
-        return new ClassDiagramDto(classDiagramText, targetClassList, classMemberMap, dependencyMap, classFilePaths);
+        return new ClassDiagramDto(classDiagramText, targetClassList, classMemberMap, dependencyMap, classFilePaths, dependencyList);
     }
 
     /**
@@ -271,6 +273,66 @@ public class ClassDiagramServiceImpl implements ClassDiagramService {
         }
         
         return dependencyMap;
+    }
+
+    /**
+     * 依存関係一覧を構築する
+     */
+    private List<ClassDependencyListItemDto> buildDependencyList(Set<ClassEntity> classes, Long projectId) {
+        List<ClassDependencyListItemDto> dependencyList = new ArrayList<>();
+        Set<Long> classIds = classes.stream()
+            .map(ClassEntity::getId)
+            .collect(Collectors.toSet());
+        Set<String> addedKeys = new HashSet<>();
+
+        for (ClassEntity sourceClass : classes) {
+            List<ClassDependency> dependencies = classDependencyRepository
+                .findBySourceClass_Id(sourceClass.getId());
+
+            for (ClassDependency dep : dependencies) {
+                if (dep.getTargetClass() == null || dep.getTargetClass().getProject() == null) {
+                    continue;
+                }
+                if (!dep.getTargetClass().getProject().getId().equals(projectId)) {
+                    continue;
+                }
+                if (!classIds.contains(dep.getTargetClass().getId())) {
+                    continue;
+                }
+
+                String dependencyKindCode = dep.getDependencyKind() != null ? dep.getDependencyKind().getCode() : "";
+                String dependencyKindName = dep.getDependencyKind() != null ? dep.getDependencyKind().getDescription() : "";
+                String parentClassName = resolveClassName(sourceClass);
+                String childClassName = resolveClassName(dep.getTargetClass());
+
+                String uniqueKey = dependencyKindCode + "|" + sourceClass.getFullQualifiedName() + "|" + dep.getTargetClass().getFullQualifiedName();
+                if (addedKeys.contains(uniqueKey)) {
+                    continue;
+                }
+                addedKeys.add(uniqueKey);
+
+                dependencyList.add(new ClassDependencyListItemDto(
+                    dependencyKindCode,
+                    dependencyKindName,
+                    parentClassName,
+                    childClassName
+                ));
+            }
+        }
+
+        return dependencyList;
+    }
+
+    private String resolveClassName(ClassEntity classEntity) {
+        if (classEntity == null) {
+            return "";
+        }
+        String simpleName = classEntity.getSimpleName();
+        if (simpleName != null && !simpleName.isEmpty()) {
+            return simpleName;
+        }
+        String fqn = classEntity.getFullQualifiedName();
+        return fqn != null ? fqn : "";
     }
 
     /**

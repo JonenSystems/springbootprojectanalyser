@@ -75,6 +75,33 @@
                 
                 <input type="hidden" id="class-diagram-text" th:value="${classDiagram.classDiagramText}">
                 
+                <!-- 依存関係一覧 -->
+                <div class="dependency-list-section" style="margin-top: 30px;">
+                    <h3>依存関係一覧</h3>
+                    <p>選択されたエンドポイントを起点としたクラス間依存関係の一覧をテーブル表示する</p>
+                    <table id="dependency-list-table" class="table" style="width: 100%; border-collapse: collapse;">
+                        <thead>
+                            <tr>
+                                <th>依存種類コード</th>
+                                <th>依存種類名</th>
+                                <th>親クラス</th>
+                                <th>子クラス</th>
+                            </tr>
+                        </thead>
+                        <tbody id="dependency-list-body">
+                            <tr th:if="${classDiagram.dependencyList == null or classDiagram.dependencyList.isEmpty()}">
+                                <td colspan="4">依存関係がありません。</td>
+                            </tr>
+                            <tr th:each="dependency : ${classDiagram.dependencyList}">
+                                <td th:text="${dependency.dependencyKindCode}"></td>
+                                <td th:text="${dependency.dependencyKindName}"></td>
+                                <td th:text="${dependency.parentClassName}"></td>
+                                <td th:text="${dependency.childClassName}"></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
                 <!-- 関連ファイル一覧 -->
                 <div th:if="${classDiagram.classFilePaths != null and !classDiagram.classFilePaths.isEmpty()}" class="related-files-section" style="margin-top: 30px;">
                     <h3>関連ファイル一覧</h3>
