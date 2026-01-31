@@ -78,6 +78,9 @@ INSERT INTO dependency_kinds (code, description) VALUES ('009_002', 'Service→R
 INSERT INTO dependency_kinds (code, description) VALUES ('009_003', 'Repository→Entity');
 INSERT INTO dependency_kinds (code, description) VALUES ('009_004', 'パス/パラメータ依存');
 INSERT INTO dependency_kinds (code, description) VALUES ('009_005', 'テストスライス');
+INSERT INTO dependency_kinds (code, description) VALUES ('009_006', 'Model→Controller');
+INSERT INTO dependency_kinds (code, description) VALUES ('011_001', 'Controller→Form');
+INSERT INTO dependency_kinds (code, description) VALUES ('011_002', 'Controller→ViewModel');
 
 -- HTTPメソッドの初期データ投入
 INSERT INTO http_methods (method_name) VALUES ('GET');
