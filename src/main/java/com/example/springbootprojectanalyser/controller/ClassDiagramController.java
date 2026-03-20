@@ -1,13 +1,17 @@
 package com.example.springbootprojectanalyser.controller;
 
+import com.example.springbootprojectanalyser.model.dto.ClassDependencyListItemDto;
 import com.example.springbootprojectanalyser.model.dto.ClassDiagramDto;
 import com.example.springbootprojectanalyser.model.dto.EndpointDto;
+import com.example.springbootprojectanalyser.model.dto.SequenceInputDto;
 import com.example.springbootprojectanalyser.model.form.ClassDiagramForm;
 import com.example.springbootprojectanalyser.repository.EndpointRepository;
 import com.example.springbootprojectanalyser.repository.ProjectRepository;
 import com.example.springbootprojectanalyser.service.ClassDiagramService;
 import com.example.springbootprojectanalyser.service.EndpointExtractionService;
+import com.example.springbootprojectanalyser.service.SequenceSliceService;
 import jakarta.validation.Valid;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.validation.BindingResult;
@@ -21,11 +25,18 @@ import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * クラス図作成コントローラー
@@ -37,16 +48,19 @@ public class ClassDiagramController {
     private final ClassDiagramService classDiagramService;
     private final ProjectRepository projectRepository;
     private final EndpointRepository endpointRepository;
+    private final SequenceSliceService sequenceSliceService;
 
     public ClassDiagramController(
             EndpointExtractionService endpointExtractionService,
             ClassDiagramService classDiagramService,
             ProjectRepository projectRepository,
-            EndpointRepository endpointRepository) {
+            EndpointRepository endpointRepository,
+            SequenceSliceService sequenceSliceService) {
         this.endpointExtractionService = endpointExtractionService;
         this.classDiagramService = classDiagramService;
         this.projectRepository = projectRepository;
         this.endpointRepository = endpointRepository;
+        this.sequenceSliceService = sequenceSliceService;
     }
 
     @GetMapping({"/classdiagram", "/classdiagram/"})
@@ -178,7 +192,7 @@ public class ClassDiagramController {
     }
 
     @GetMapping("/classdiagram/download-files")
-    public org.springframework.http.ResponseEntity<String> downloadConcatenatedFiles(
+    public org.springframework.http.ResponseEntity<byte[]> downloadRelatedFilesZip(
             @RequestParam("projectId") Long projectId,
             @RequestParam("endpointUri") String endpointUri,
             @RequestParam("httpMethod") String httpMethod) {
@@ -203,39 +217,90 @@ public class ClassDiagramController {
             
             UUID endpointId = UUID.fromString(targetEndpoint.endpointId());
             ClassDiagramDto classDiagram = classDiagramService.generateClassDiagram(endpointId, projectId);
-            
-            // ファイル内容を連結
-            String concatenatedContent = concatenateFiles(project.getRootPath(), classDiagram.classFilePaths());
-            
+            String readmeContent = buildReadmeContent(
+                project.getRootPath(),
+                targetEndpoint,
+                classDiagram
+            );
+            byte[] zipBytes = createZipBytes(project.getRootPath(), classDiagram.classFilePaths(), readmeContent);
+
             // ファイル名を生成（エンドポイント情報を含む）
             String fileName = generateFileName(endpointUri, httpMethod);
-            
+
             // レスポンスヘッダーを設定
             org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-            headers.setContentType(org.springframework.http.MediaType.TEXT_PLAIN);
+            headers.setContentType(org.springframework.http.MediaType.APPLICATION_OCTET_STREAM);
             headers.setContentDispositionFormData("attachment", fileName);
-            
+
             return org.springframework.http.ResponseEntity.ok()
                 .headers(headers)
-                .body(concatenatedContent);
+                .body(zipBytes);
                 
         } catch (Exception e) {
             e.printStackTrace();
             return org.springframework.http.ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
-                .body("エラー: " + e.getMessage());
+                .body(("エラー: " + e.getMessage()).getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    @GetMapping("/classdiagram/download-sequence")
+    public org.springframework.http.ResponseEntity<byte[]> downloadSequenceInputJson(
+            @RequestParam("projectId") Long projectId,
+            @RequestParam("selectedEndpointId") String selectedEndpointId) {
+        try {
+            com.example.springbootprojectanalyser.model.entity.Project project = projectRepository.findById(projectId)
+                .orElseThrow(() -> new IllegalArgumentException("プロジェクトが見つかりません"));
+
+            com.example.springbootprojectanalyser.model.entity.Endpoint endpointEntity =
+                endpointRepository.findById(selectedEndpointId)
+                    .orElseThrow(() -> new IllegalArgumentException("エンドポイントが見つかりません: " + selectedEndpointId));
+
+            EndpointDto endpointDto = new EndpointDto(
+                endpointEntity.getEndpointId(),
+                endpointEntity.getClassEntity() != null ? endpointEntity.getClassEntity().getId() : null,
+                endpointEntity.getClassEntity() != null ? endpointEntity.getClassEntity().getSimpleName() : "",
+                endpointEntity.getUri(),
+                endpointEntity.getHttpMethod() != null ? endpointEntity.getHttpMethod().getId() : null,
+                endpointEntity.getHttpMethod() != null ? endpointEntity.getHttpMethod().getMethodName() : ""
+            );
+
+            UUID endpointId = UUID.fromString(selectedEndpointId);
+            ClassDiagramDto classDiagram = classDiagramService.generateClassDiagram(endpointId, projectId);
+
+            SequenceInputDto sequenceInput = sequenceSliceService.generateSequenceInput(
+                classDiagram,
+                endpointDto,
+                project.getRootPath()
+            );
+
+            ObjectMapper objectMapper = new ObjectMapper();
+            byte[] jsonBytes = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(sequenceInput);
+
+            String fileName = generateSequenceFileName(endpointDto.uri(), endpointDto.httpMethodName());
+            byte[] zipBytes = createSequenceZipBytes(jsonBytes);
+
+            org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+            headers.setContentType(org.springframework.http.MediaType.APPLICATION_OCTET_STREAM);
+            headers.setContentDispositionFormData("attachment", fileName);
+
+            return org.springframework.http.ResponseEntity.ok()
+                .headers(headers)
+                .body(zipBytes);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return org.springframework.http.ResponseEntity.status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(("エラー: " + e.getMessage()).getBytes(StandardCharsets.UTF_8));
         }
     }
 
     /**
-     * ファイル内容を連結する
+     * 関連ファイルをZIP化する
      */
-    private String concatenateFiles(String projectRootPath, Map<String, String> classFilePaths) {
-        StringBuilder sb = new StringBuilder();
-        java.nio.file.Path projectRoot = java.nio.file.Paths.get(projectRootPath);
-        
-        // プロジェクトルートからJavaファイルを収集（キャッシュ）
-        Map<String, java.nio.file.Path> javaFileCache = new HashMap<>();
-        try (java.util.stream.Stream<java.nio.file.Path> paths = java.nio.file.Files.walk(projectRoot)) {
+    private byte[] createZipBytes(String projectRootPath, Map<String, String> classFilePaths, String readmeContent) {
+        Path projectRoot = java.nio.file.Paths.get(projectRootPath);
+
+        Map<String, Path> javaFileCache = new HashMap<>();
+        try (java.util.stream.Stream<Path> paths = java.nio.file.Files.walk(projectRoot)) {
             paths.filter(java.nio.file.Files::isRegularFile)
                 .filter(p -> p.toString().endsWith(".java"))
                 .filter(p -> !p.toString().contains("target"))
@@ -251,96 +316,173 @@ public class ClassDiagramController {
         } catch (Exception e) {
             // ファイル検索エラーは無視
         }
-        
-        for (Map.Entry<String, String> entry : classFilePaths.entrySet()) {
-            String fqn = entry.getKey();
-            String filePath = entry.getValue();
-            
-            // まず、生成されたファイルパスで検索
-            java.nio.file.Path fullPath = projectRoot.resolve(filePath);
-            java.nio.file.Path foundFile = null;
-            String foundPath = filePath;
-            
-            if (java.nio.file.Files.exists(fullPath) && java.nio.file.Files.isRegularFile(fullPath)) {
-                foundFile = fullPath;
-            } else {
-                // ファイルが見つからない場合、クラスFQNから複数の可能性のあるパスを試す
-                String[] possiblePaths = generatePossiblePaths(fqn);
-                for (String possiblePath : possiblePaths) {
-                    java.nio.file.Path possibleFullPath = projectRoot.resolve(possiblePath);
-                    if (java.nio.file.Files.exists(possibleFullPath) && java.nio.file.Files.isRegularFile(possibleFullPath)) {
-                        foundFile = possibleFullPath;
-                        foundPath = possiblePath;
-                        break;
+
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             ZipOutputStream zos = new ZipOutputStream(baos, StandardCharsets.UTF_8)) {
+            Set<String> addedEntries = new HashSet<>();
+            if (readmeContent != null && !readmeContent.isEmpty()) {
+                String readmeName = "README.md";
+                if (addedEntries.add(readmeName)) {
+                    ZipEntry readmeEntry = new ZipEntry(readmeName);
+                    zos.putNextEntry(readmeEntry);
+                    zos.write(readmeContent.getBytes(StandardCharsets.UTF_8));
+                    zos.closeEntry();
+                }
+            }
+            for (Map.Entry<String, String> entry : classFilePaths.entrySet()) {
+                ResolvedFile resolved = resolveFile(projectRoot, javaFileCache, entry.getKey(), entry.getValue());
+                String entryName = normalizeZipEntryName(resolved.entryPath());
+
+                if (resolved.exists()) {
+                    if (addedEntries.add(entryName)) {
+                        ZipEntry zipEntry = new ZipEntry(entryName);
+                        zos.putNextEntry(zipEntry);
+                        byte[] content = java.nio.file.Files.readAllBytes(resolved.path());
+                        zos.write(content);
+                        zos.closeEntry();
+                    }
+                } else {
+                    String missingEntryName = entryName + ".missing.txt";
+                    if (addedEntries.add(missingEntryName)) {
+                        ZipEntry zipEntry = new ZipEntry(missingEntryName);
+                        zos.putNextEntry(zipEntry);
+                        String message = "File not found: " + resolved.entryPath() + "\nFQN: " + entry.getKey() + "\n";
+                        zos.write(message.getBytes(StandardCharsets.UTF_8));
+                        zos.closeEntry();
                     }
                 }
-                
-                // まだ見つからない場合、キャッシュからクラス名で検索
-                if (foundFile == null) {
-                    int lastDotIndex = fqn.lastIndexOf('.');
-                    String className = lastDotIndex >= 0 ? fqn.substring(lastDotIndex + 1) : fqn;
-                    String searchFileName = className + ".java";
-                    
-                    for (Map.Entry<String, java.nio.file.Path> cacheEntry : javaFileCache.entrySet()) {
-                        if (cacheEntry.getKey().endsWith("/" + searchFileName) || cacheEntry.getKey().equals(searchFileName)) {
-                            // ファイル内容を確認してFQNが一致するか検証
-                            try {
-                                JavaParser parser = new JavaParser();
-                                CompilationUnit cu = parser.parse(cacheEntry.getValue()).getResult().orElse(null);
-                                if (cu != null) {
-                                    String filePackageName = cu.getPackageDeclaration()
-                                        .map(pd -> pd.getNameAsString())
-                                        .orElse("");
-                                    List<ClassOrInterfaceDeclaration> classDecls = 
-                                        cu.findAll(ClassOrInterfaceDeclaration.class);
-                                    for (ClassOrInterfaceDeclaration classDecl : classDecls) {
-                                        String fileClassName = classDecl.getNameAsString();
-                                        String fileFqn = filePackageName.isEmpty() 
-                                            ? fileClassName 
-                                            : filePackageName + "." + fileClassName;
-                                        if (fileFqn.equals(fqn)) {
-                                            foundFile = cacheEntry.getValue();
-                                            foundPath = cacheEntry.getKey();
-                                            break;
-                                        }
-                                    }
-                                    if (foundFile != null) {
-                                        break;
-                                    }
-                                }
-                            } catch (Exception e) {
-                                // パースエラーは無視
+            }
+            zos.finish();
+            return baos.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("ZIP生成に失敗しました: " + e.getMessage(), e);
+        }
+    }
+
+    private String normalizeZipEntryName(String entryName) {
+        if (entryName == null || entryName.isEmpty()) {
+            return "unknown.java";
+        }
+        return entryName.replace('\\', '/');
+    }
+
+    private ResolvedFile resolveFile(Path projectRoot, Map<String, Path> javaFileCache, String fqn, String filePath) {
+        Path fullPath = projectRoot.resolve(filePath);
+        String foundPath = filePath;
+
+        if (java.nio.file.Files.exists(fullPath) && java.nio.file.Files.isRegularFile(fullPath)) {
+            return new ResolvedFile(fullPath, foundPath, true);
+        }
+
+        String[] possiblePaths = generatePossiblePaths(fqn);
+        for (String possiblePath : possiblePaths) {
+            Path possibleFullPath = projectRoot.resolve(possiblePath);
+            if (java.nio.file.Files.exists(possibleFullPath) && java.nio.file.Files.isRegularFile(possibleFullPath)) {
+                return new ResolvedFile(possibleFullPath, possiblePath, true);
+            }
+        }
+
+        int lastDotIndex = fqn.lastIndexOf('.');
+        String className = lastDotIndex >= 0 ? fqn.substring(lastDotIndex + 1) : fqn;
+        String searchFileName = className + ".java";
+
+        for (Map.Entry<String, Path> cacheEntry : javaFileCache.entrySet()) {
+            if (cacheEntry.getKey().endsWith("/" + searchFileName) || cacheEntry.getKey().equals(searchFileName)) {
+                try {
+                    JavaParser parser = new JavaParser();
+                    CompilationUnit cu = parser.parse(cacheEntry.getValue()).getResult().orElse(null);
+                    if (cu != null) {
+                        String filePackageName = cu.getPackageDeclaration()
+                            .map(pd -> pd.getNameAsString())
+                            .orElse("");
+                        List<ClassOrInterfaceDeclaration> classDecls =
+                            cu.findAll(ClassOrInterfaceDeclaration.class);
+                        for (ClassOrInterfaceDeclaration classDecl : classDecls) {
+                            String fileClassName = classDecl.getNameAsString();
+                            String fileFqn = filePackageName.isEmpty()
+                                ? fileClassName
+                                : filePackageName + "." + fileClassName;
+                            if (fileFqn.equals(fqn)) {
+                                return new ResolvedFile(cacheEntry.getValue(), cacheEntry.getKey(), true);
                             }
                         }
                     }
-                }
-            }
-            
-            // ファイルヘッダーを追加
-            sb.append("===== FILE: ").append(foundPath).append(" =====\n");
-            
-            if (foundFile != null && java.nio.file.Files.exists(foundFile) && java.nio.file.Files.isRegularFile(foundFile)) {
-                try {
-                    // ファイル内容を読み込む
-                    String content = java.nio.file.Files.readString(foundFile, java.nio.charset.StandardCharsets.UTF_8);
-                    sb.append(content);
-                    
-                    // ファイル間に空行を追加
-                    if (!content.endsWith("\n")) {
-                        sb.append("\n");
-                    }
-                    sb.append("\n");
                 } catch (Exception e) {
-                    // ファイル読み込みエラー
-                    sb.append("// Error reading file: ").append(e.getMessage()).append("\n\n");
+                    // パースエラーは無視
                 }
-            } else {
-                // ファイルが存在しない場合
-                sb.append("// File not found\n\n");
             }
         }
-        
+
+        return new ResolvedFile(fullPath, foundPath, false);
+    }
+
+    private String buildReadmeContent(
+        String projectRootPath,
+        EndpointDto endpoint,
+        ClassDiagramDto classDiagram) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("# クラス図作成機能 解析結果\n\n");
+
+        sb.append("## 対象プロジェクト（パス）\n");
+        sb.append(projectRootPath).append("\n\n");
+
+        sb.append("## エンドポイント（URI(HTTPメソッド) : クラス名）\n");
+        String endpointUri = endpoint != null ? endpoint.uri() : "";
+        String httpMethod = endpoint != null ? endpoint.httpMethodName() : "";
+        String className = endpoint != null ? endpoint.className() : "";
+        sb.append(endpointUri).append("(").append(httpMethod).append(") : ").append(className).append("\n\n");
+
+        sb.append("## 生成日\n");
+        sb.append(java.time.LocalDateTime.now().toString()).append("\n\n");
+
+        sb.append("## 解析結果（mermaidクラス図）\n");
+        sb.append("```mermaid\n");
+        if (classDiagram != null && classDiagram.classDiagramText() != null) {
+            sb.append(classDiagram.classDiagramText());
+            if (!classDiagram.classDiagramText().endsWith("\n")) {
+                sb.append("\n");
+            }
+        }
+        sb.append("```\n\n");
+
+        sb.append("## 依存関係一覧\n");
+        sb.append("| 依存種類コード | 依存種類名 | 親クラス | 子クラス |\n");
+        sb.append("|---|---|---|---|\n");
+        if (classDiagram == null || classDiagram.dependencyList() == null || classDiagram.dependencyList().isEmpty()) {
+            sb.append("| - | - | - | - |\n");
+        } else {
+            for (ClassDependencyListItemDto item : classDiagram.dependencyList()) {
+                sb.append("| ")
+                    .append(safeMarkdownCell(item.dependencyKindCode()))
+                    .append(" | ")
+                    .append(safeMarkdownCell(item.dependencyKindName()))
+                    .append(" | ")
+                    .append(safeMarkdownCell(item.parentClassName()))
+                    .append(" | ")
+                    .append(safeMarkdownCell(item.childClassName()))
+                    .append(" |\n");
+            }
+        }
+        sb.append("\n");
+
+        sb.append("## 関連ファイル一覧\n");
+        if (classDiagram == null || classDiagram.classFilePaths() == null || classDiagram.classFilePaths().isEmpty()) {
+            sb.append("- なし\n");
+        } else {
+            for (Map.Entry<String, String> entry : classDiagram.classFilePaths().entrySet()) {
+                sb.append("- ").append(entry.getValue())
+                    .append(" (").append(entry.getKey()).append(")\n");
+            }
+        }
+
         return sb.toString();
+    }
+
+    private String safeMarkdownCell(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("|", "\\|").replace("\n", " ").replace("\r", " ");
     }
 
     /**
@@ -389,8 +531,42 @@ public class ClassDiagramController {
         // 先頭のアンダースコアを削除
         safeUri = safeUri.replaceAll("^_+", "");
         
-        String fileName = safeUri + "(" + httpMethod + ").txt";
+        String fileName = safeUri + "(" + httpMethod + ").zip";
         return fileName;
+    }
+
+    private String generateSequenceFileName(String endpointUri, String httpMethod) {
+        String safeUri = endpointUri.replace("/", "_")
+                                   .replace("\\", "_")
+                                   .replace(":", "_")
+                                   .replace("*", "_")
+                                   .replace("?", "_")
+                                   .replace("\"", "_")
+                                   .replace("<", "_")
+                                   .replace(">", "_")
+                                   .replace("|", "_");
+        if (safeUri.isEmpty() || safeUri.equals("_")) {
+            safeUri = "root";
+        }
+        safeUri = safeUri.replaceAll("^_+", "");
+        return "sequence-input-" + safeUri + "(" + httpMethod + ").zip";
+    }
+
+    private byte[] createSequenceZipBytes(byte[] jsonBytes) {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             ZipOutputStream zos = new ZipOutputStream(baos, StandardCharsets.UTF_8)) {
+            ZipEntry entry = new ZipEntry("sequence_input.json");
+            zos.putNextEntry(entry);
+            zos.write(jsonBytes);
+            zos.closeEntry();
+            zos.finish();
+            return baos.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("ZIP生成に失敗しました: " + e.getMessage(), e);
+        }
+    }
+
+    private record ResolvedFile(Path path, String entryPath, boolean exists) {
     }
 }
 

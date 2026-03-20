@@ -70,6 +70,11 @@
                 <div class="form-group">
                     <button type="button" id="download-btn" class="btn btn-primary">クラス図ダウンロード</button>
                 </div>
+                <div class="form-group" style="margin-top: 10px;">
+                    <a th:href="@{/classdiagram/download-sequence(projectId=${projectId}, selectedEndpointId=${selectedEndpointId})}"
+                       id="download-sequence-btn"
+                       class="btn btn-secondary">シーケンス図入力JSON ZIPをダウンロード</a>
+                </div>
                 
                 <div id="mermaid-diagram" class="mermaid"></div>
                 
@@ -108,7 +113,7 @@
                     <div class="form-group" style="margin-top: 10px; margin-bottom: 20px;">
                         <a th:href="@{/classdiagram/download-files(projectId=${projectId}, endpointUri=${selectedEndpointUri}, httpMethod=${selectedEndpointHttpMethod})}" 
                            id="download-files-btn" 
-                           class="btn btn-secondary">連結ファイルをダウンロード</a>
+                           class="btn btn-secondary">関連ファイルZIPをダウンロード</a>
                     </div>
                     <ul class="file-list" style="list-style: none; padding: 0;">
                         <li th:each="entry : ${classDiagram.classFilePaths}" style="padding: 5px 0; border-bottom: 1px solid #eee;">
