@@ -5,6 +5,7 @@ import java.util.List;
 
 /**
  * シーケンス図のフロー情報
+ * <p>type の例: call, return_view, session, db, alt_hint, dependency（依存関係一覧由来。label は 依存種類コード_依存種類名。同一親子は集約しカンマ区切り）</p>
  */
 public record FlowDto(
     String type,

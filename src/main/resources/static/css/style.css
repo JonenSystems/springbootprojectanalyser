@@ -229,6 +229,11 @@ body {
     background-color: #f8f9fa;
 }
 
+/* クラス図・シーケンス図用：多行Mermaidソース（画面非表示） */
+.diagram-source-hidden {
+    display: none !important;
+}
+
 /* フッター */
 .footer {
     text-align: center;

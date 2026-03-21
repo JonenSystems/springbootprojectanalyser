@@ -8,55 +8,80 @@ document.addEventListener('DOMContentLoaded', function() {
         theme: 'default',
         securityLevel: 'loose'
     });
-    
-    // クラス図をレンダリング
+
+    /**
+     * 多行テキストは textarea / input のいずれでも取得できるようにする
+     */
+    function readDiagramSource(el) {
+        if (!el) {
+            return '';
+        }
+        var v = el.value;
+        if (v === undefined || v === null) {
+            v = el.textContent || '';
+        }
+        return String(v).trim();
+    }
+
+    // クラス図をレンダリング → 完了後にシーケンス図（同一ページで mermaid.run を直列化）
     const hiddenInput = document.getElementById('class-diagram-text');
     const mermaidElement = document.getElementById('mermaid-diagram');
-    
-    if (hiddenInput && mermaidElement && hiddenInput.value) {
-        const diagramText = hiddenInput.value.trim();
-        
-        if (diagramText) {
-            // Mermaidのテキストを設定
-            mermaidElement.textContent = diagramText;
-            
-            // Mermaidでレンダリング
-            mermaid.run({
-                nodes: [mermaidElement]
-            }).catch(function(error) {
-                console.error('Mermaid rendering error:', error);
-                mermaidElement.innerHTML = '<p class="text-danger">クラス図の表示中にエラーが発生しました: ' + error.message + '</p>';
-            });
-        }
+    const sequenceHiddenInput = document.getElementById('sequence-diagram-text');
+    const sequenceMermaidElement = document.getElementById('sequence-mermaid-diagram');
+
+    var classPromise = Promise.resolve();
+    var diagramText = readDiagramSource(hiddenInput);
+    if (hiddenInput && mermaidElement && diagramText) {
+        mermaidElement.textContent = diagramText;
+        classPromise = Promise.resolve(mermaid.run({ nodes: [mermaidElement] })).catch(function(error) {
+            console.error('Mermaid rendering error:', error);
+            mermaidElement.innerHTML = '<p class="text-danger">クラス図の表示中にエラーが発生しました: ' + error.message + '</p>';
+        });
     }
+
+    classPromise.then(function() {
+        var sequenceDiagramText = readDiagramSource(sequenceHiddenInput);
+        if (!sequenceHiddenInput || !sequenceMermaidElement || !sequenceDiagramText) {
+            return;
+        }
+        sequenceMermaidElement.textContent = sequenceDiagramText;
+        return Promise.resolve(mermaid.run({ nodes: [sequenceMermaidElement] })).catch(function(error) {
+            console.error('Mermaid rendering error (sequence):', error);
+            sequenceMermaidElement.innerHTML = '<p class="text-danger">シーケンス図の表示中にエラーが発生しました: ' + error.message + '</p>';
+        });
+    });
     
-    // ダウンロードボタンの処理
+    // ダウンロードボタンの処理（クラス図・シーケンス図を Mermaid 形式で1ファイルにまとめる）
     const downloadButton = document.getElementById('download-btn');
     if (downloadButton) {
         downloadButton.addEventListener('click', function() {
-            // 隠しフィールドからクラス図テキストを取得
-            if (hiddenInput && hiddenInput.value) {
-                const classDiagramText = hiddenInput.value.trim();
-                // 先頭に```mermaidを、末尾に```を追加
-                const markdownText = '```mermaid\n' + classDiagramText + '\n```';
-                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-                const fileName = `class-diagram-${timestamp}.md`;
-                
-                // Blobオブジェクトを作成
-                const blob = new Blob([markdownText], { type: 'text/markdown' });
-                const url = URL.createObjectURL(blob);
-                
-                // ダウンロードリンクを作成してクリック
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = fileName;
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-                
-                // URLを解放
-                URL.revokeObjectURL(url);
+            const classDiagramText = hiddenInput ? readDiagramSource(hiddenInput) : '';
+            const sequenceDiagramText = sequenceHiddenInput ? readDiagramSource(sequenceHiddenInput) : '';
+            if (!classDiagramText && !sequenceDiagramText) {
+                return;
             }
+            var sections = [];
+            if (classDiagramText) {
+                sections.push('## クラス図\n\n```mermaid\n' + classDiagramText + '\n```\n');
+            }
+            if (sequenceDiagramText) {
+                sections.push('\n## シーケンス図\n\n```mermaid\n' + sequenceDiagramText + '\n```\n');
+            }
+            var markdownText = sections.join('');
+            var timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+            var fileName = 'mermaid-diagram-' + timestamp + '.md';
+
+            var blob = new Blob([markdownText], { type: 'text/markdown' });
+            var url = URL.createObjectURL(blob);
+
+            var link = document.createElement('a');
+            link.href = url;
+            link.download = fileName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+
+            URL.revokeObjectURL(url);
         });
     }
     

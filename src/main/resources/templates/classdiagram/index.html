@@ -68,7 +68,7 @@
                 <h2>解析結果</h2>
                 
                 <div class="form-group">
-                    <button type="button" id="download-btn" class="btn btn-primary">クラス図ダウンロード</button>
+                    <button type="button" id="download-btn" class="btn btn-primary">クラス図・シーケンス図ダウンロード</button>
                 </div>
                 <div class="form-group" style="margin-top: 10px;">
                     <a th:href="@{/classdiagram/download-sequence(projectId=${projectId}, selectedEndpointId=${selectedEndpointId})}"
@@ -77,8 +77,29 @@
                 </div>
                 
                 <div id="mermaid-diagram" class="mermaid"></div>
-                
-                <input type="hidden" id="class-diagram-text" th:value="${classDiagram.classDiagramText}">
+                <!-- 多行Mermaidは input hidden だと改行が壊れるため textarea で保持する -->
+                <textarea id="class-diagram-text" class="diagram-source-hidden" readonly
+                          th:text="${classDiagram.classDiagramText}"></textarea>
+
+                <!-- 解析結果（シーケンス図） -->
+                <div th:if="${sequenceDiagramText != null and !sequenceDiagramText.isEmpty()}" style="margin-top: 30px;">
+                    <h3>シーケンス図（選択エンドポイント起点）</h3>
+                    <p class="text-muted" id="sequence-diagram-legend">
+                        <strong>動的フロー</strong>：エンドポイントのハンドラから静的解析した呼び出しパス（同一メソッド内はソース行番号順）。<br/>
+                        <strong>静的フロー</strong>：依存関係一覧と同じ解析結果に基づく矢印（図内では <code>Note</code> の後半に表示。ラベルは依存種類コード_依存種類名）。
+                    </p>
+                    <p th:if="${!#strings.contains(sequenceDiagramText, 'Note right of DB')}"
+                       class="alert alert-info" id="sequence-db-note-hint">
+                        DB の Note（記憶媒体の注記）は、静的解析でリポジトリ層の <code>createQuery</code> / <code>createNativeQuery</code> / <code>createNamedQuery</code> が検出されたときに表示されます。
+                    </p>
+                    <div id="sequence-mermaid-diagram" class="mermaid"></div>
+                    <textarea id="sequence-diagram-text" class="diagram-source-hidden" readonly
+                              th:text="${sequenceDiagramText}"></textarea>
+                </div>
+
+                <div th:if="${sequenceDiagramText != null and sequenceDiagramText.isEmpty()}" class="alert alert-warning" style="margin-top: 30px;">
+                    <p>シーケンス図の生成に失敗しました。</p>
+                </div>
                 
                 <!-- 依存関係一覧 -->
                 <div class="dependency-list-section" style="margin-top: 30px;">

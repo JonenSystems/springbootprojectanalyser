@@ -20,6 +20,7 @@ import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -27,6 +28,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -35,6 +37,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.ast.type.Type;
 
 /**
  * シーケンス図作成用JSON生成サービス実装
@@ -77,6 +85,18 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
         List<FlowDto> flows = new ArrayList<>();
         List<BranchHintDto> branchHints = new ArrayList<>();
         Map<String, ParticipantDto> participants = new LinkedHashMap<>();
+
+        // doc/sequenceDiagram.md のルールに合わせ、クラス図に含まれる全クラスをノード定義に含める
+        // （実際にフローが到達しないクラスも participant 宣言だけ行う）
+        if (classDiagram.targetClasses() != null) {
+            for (ClassInfoDto classInfo : classDiagram.targetClasses()) {
+                if (classInfo == null || classInfo.fullQualifiedName() == null || classInfo.fullQualifiedName().isEmpty()) {
+                    continue;
+                }
+                metaIndex.findByFqn(classInfo.fullQualifiedName())
+                    .ifPresent(meta -> addParticipant(participants, buildParticipantFromMeta(meta, metaIndex)));
+            }
+        }
 
         addParticipant(participants, buildUserParticipant());
         addParticipant(participants, buildClassParticipant(controllerMeta));
@@ -181,7 +201,7 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
             }
 
             Map<String, String> parameterTypes = extractParameterTypes(methodDecl);
-            List<MethodCallExpr> calls = methodDecl.findAll(MethodCallExpr.class);
+            List<MethodCallExpr> calls = collectMethodCallsInSourceOrder(methodDecl);
             for (MethodCallExpr callExpr : calls) {
                 if (isInsideIfStmt(callExpr)) {
                     // alt_hintに含めるため通常フローには含めない
@@ -216,7 +236,12 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
                 Optional<ClassMeta> targetMetaOpt = resolveTargetClass(callExpr, ref.meta(), metaIndex);
                 if (targetMetaOpt.isEmpty()) {
                     if (isRepositoryLayer(ref.meta().layer())) {
-                        Optional<DbFlowInfo> dbFlowInfo = resolveDbFlow(callExpr);
+                        Optional<DbFlowInfo> dbFlowInfo = resolveDbFlow(
+                            callExpr,
+                            ref.meta(),
+                            metaIndex,
+                            classFilePaths,
+                            projectRootPath);
                         if (dbFlowInfo.isPresent()) {
                             addParticipant(participants, buildDbParticipant());
                             DbFlowInfo info = dbFlowInfo.get();
@@ -266,7 +291,12 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
                 ));
 
                 if (isRepositoryLayer(targetMeta.layer())) {
-                    Optional<DbFlowInfo> dbFlowInfo = resolveDbFlow(callExpr);
+                    Optional<DbFlowInfo> dbFlowInfo = resolveDbFlow(
+                        callExpr,
+                        targetMeta,
+                        metaIndex,
+                        classFilePaths,
+                        projectRootPath);
                     if (dbFlowInfo.isPresent()) {
                         addParticipant(participants, buildDbParticipant());
                         DbFlowInfo info = dbFlowInfo.get();
@@ -301,6 +331,9 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
             }
         }
 
+        // クラス図の依存関係一覧（解析済み）をシーケンス図に反映（ラベルは 依存種類コード_依存種類名、同一親子は1矢印に集約）
+        appendDependencyListFlows(classDiagram.dependencyList(), participants, flows, metaIndex);
+
         List<String> participantOrder = buildParticipantOrder(participants);
         ProjectInfoDto project = buildProjectInfo(projectRootPath, endpoint);
         EntryPointDto entry = new EntryPointDto(endpoint.httpMethodName(), endpoint.uri(), handlerDisplay);
@@ -317,6 +350,116 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
             evidence,
             branchHints
         );
+    }
+
+    /**
+     * 依存関係一覧（DB に保存された解析結果）をシーケンス図フローに追加する。
+     * ラベルは「依存種類コード_依存種類名」。同一（親 participant, 子 participant）の行は1本の矢印にまとめ、ラベルをカンマ区切りで連結する。
+     */
+    private void appendDependencyListFlows(
+        List<ClassDependencyListItemDto> dependencyList,
+        Map<String, ParticipantDto> participants,
+        List<FlowDto> flows,
+        ClassMetaIndex metaIndex) {
+        if (dependencyList == null || dependencyList.isEmpty()) {
+            return;
+        }
+        // fromId -> (toId -> ラベル断片の集合（順序・重複除去）)
+        Map<String, Map<String, LinkedHashSet<String>>> fromToLabelParts = new LinkedHashMap<>();
+        for (ClassDependencyListItemDto item : dependencyList) {
+            if (item == null) {
+                continue;
+            }
+            String parent = item.parentClassName();
+            String child = item.childClassName();
+            String code = item.dependencyKindCode();
+            String kindName = item.dependencyKindName();
+            if (parent == null || child == null || code == null) {
+                continue;
+            }
+            parent = parent.trim();
+            child = child.trim();
+            code = code.trim();
+            if (parent.isEmpty() || child.isEmpty() || code.isEmpty()) {
+                continue;
+            }
+            String fromId = resolveParticipantIdForDependencyEdge(parent, participants, metaIndex);
+            String toId = resolveParticipantIdForDependencyEdge(child, participants, metaIndex);
+            if (fromId == null || toId == null) {
+                continue;
+            }
+            String namePart = kindName != null ? kindName.trim() : "";
+            String labelPart = namePart.isEmpty() ? code : code + "_" + namePart;
+            fromToLabelParts
+                .computeIfAbsent(fromId, k -> new LinkedHashMap<>())
+                .computeIfAbsent(toId, k -> new LinkedHashSet<>())
+                .add(labelPart);
+        }
+        for (Map.Entry<String, Map<String, LinkedHashSet<String>>> fromEntry : fromToLabelParts.entrySet()) {
+            String fromId = fromEntry.getKey();
+            for (Map.Entry<String, LinkedHashSet<String>> toEntry : fromEntry.getValue().entrySet()) {
+                String toId = toEntry.getKey();
+                // 横長防止のためカンマの直後に改行（Mermaid はラベル内の <br/> で折り返し）
+                String mergedLabel = String.join(",<br/>", toEntry.getValue());
+                flows.add(new FlowDto(
+                    "dependency",
+                    fromId,
+                    toId,
+                    mergedLabel,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null
+                ));
+            }
+        }
+    }
+
+    /**
+     * 依存一覧のクラス名を、シーケンス図の participant id（多くは単純クラス名／DIはIF名）に合わせる。
+     */
+    private String resolveParticipantIdForDependencyEdge(
+        String classSimpleName,
+        Map<String, ParticipantDto> participants,
+        ClassMetaIndex metaIndex) {
+        if (classSimpleName == null || classSimpleName.isBlank()) {
+            return null;
+        }
+        String trimmed = classSimpleName.trim();
+        if (participants.containsKey(trimmed)) {
+            return trimmed;
+        }
+        Optional<ClassMeta> metaOpt = metaIndex.findBySimpleName(trimmed);
+        if (metaOpt.isEmpty()) {
+            return null;
+        }
+        ClassMeta meta = metaOpt.get();
+        if (!meta.isInterface()) {
+            Optional<String> ifaceFqnOpt = metaIndex.resolveInterfaceFqnForImpl(meta.fqn());
+            if (ifaceFqnOpt.isPresent()) {
+                String ifaceSimple = simpleNameFromFqn(ifaceFqnOpt.get());
+                if (participants.containsKey(ifaceSimple)) {
+                    return ifaceSimple;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String simpleNameFromFqn(String fqn) {
+        if (fqn == null || fqn.isEmpty()) {
+            return "";
+        }
+        int lastDot = fqn.lastIndexOf('.');
+        return lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn;
     }
 
     private ProjectInfoDto buildProjectInfo(String projectRootPath, EndpointDto endpoint) {
@@ -373,15 +516,225 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
         return sorted;
     }
 
-    private Optional<DbFlowInfo> resolveDbFlow(MethodCallExpr callExpr) {
+    private Optional<DbFlowInfo> resolveDbFlow(
+        MethodCallExpr callExpr,
+        ClassMeta repositoryMeta,
+        ClassMetaIndex metaIndex,
+        Map<String, String> classFilePaths,
+        String projectRootPath) {
         String name = callExpr.getNameAsString();
         if (!name.equals("createQuery") && !name.equals("createNativeQuery") && !name.equals("createNamedQuery")) {
             return Optional.empty();
         }
         String op = name.equals("createNativeQuery") ? "SQL" : "JPQL";
         String query = extractStringLiteralArg(callExpr).orElse(null);
-        DbNoteDto note = new DbNoteDto("JPA/" + op, null, null);
+        String dbProduct = inferDbProductLabel(projectRootPath);
+        String defaultSchema = defaultSchemaForProduct(dbProduct);
+
+        Optional<ClassMeta> entityMeta = resolveEntityMetaForRepository(
+            repositoryMeta,
+            metaIndex,
+            classFilePaths,
+            projectRootPath);
+
+        String tableLogical = null;
+        String schema = null;
+
+        if (entityMeta.isPresent()) {
+            ClassMeta em = entityMeta.get();
+            tableLogical = em.tableName() != null && !em.tableName().isBlank()
+                ? em.tableName()
+                : em.simpleName();
+            schema = defaultSchema;
+        } else if (query != null && !query.isBlank()) {
+            if ("SQL".equals(op)) {
+                tableLogical = extractSqlFromTable(query).orElse(null);
+            } else {
+                Optional<String> entityOrAlias = extractJpqlFromRoot(query);
+                if (entityOrAlias.isPresent()) {
+                    String root = entityOrAlias.get();
+                    Optional<ClassMeta> fromMeta = metaIndex.findBySimpleName(root);
+                    if (fromMeta.isPresent()) {
+                        ClassMeta em = fromMeta.get();
+                        tableLogical = em.tableName() != null && !em.tableName().isBlank()
+                            ? em.tableName()
+                            : em.simpleName();
+                    } else {
+                        tableLogical = root;
+                    }
+                }
+            }
+            schema = defaultSchema;
+        }
+
+        DbNoteDto note = new DbNoteDto(dbProduct, schema, tableLogical);
         return Optional.of(new DbFlowInfo(op, query, note));
+    }
+
+    /**
+     * application.properties / application.yml から JDBC URL を読み、DB 製品名（表示用）を推定する。
+     */
+    private String inferDbProductLabel(String projectRootPath) {
+        if (projectRootPath == null || projectRootPath.isBlank()) {
+            return "Relational DB";
+        }
+        String text = readSpringDatasourceConfigText(projectRootPath);
+        if (text == null || text.isBlank()) {
+            return "Relational DB";
+        }
+        String lower = text.toLowerCase();
+        if (lower.contains("jdbc:h2")) {
+            return "H2 Database";
+        }
+        if (lower.contains("jdbc:postgresql")) {
+            return "PostgreSQL";
+        }
+        if (lower.contains("jdbc:mysql")) {
+            return "MySQL";
+        }
+        if (lower.contains("jdbc:mariadb")) {
+            return "MariaDB";
+        }
+        if (lower.contains("jdbc:sqlserver")) {
+            return "SQL Server";
+        }
+        if (lower.contains("jdbc:oracle")) {
+            return "Oracle Database";
+        }
+        return "Relational DB";
+    }
+
+    /**
+     * 解析対象プロジェクトの設定ファイルから、データソース URL が含まれるテキストを読む。
+     */
+    private String readSpringDatasourceConfigText(String projectRootPath) {
+        Path base = Paths.get(projectRootPath).resolve("src/main/resources");
+        Path[] candidates = new Path[] {
+            base.resolve("application.properties"),
+            base.resolve("application.yml"),
+            base.resolve("application.yaml")
+        };
+        for (Path p : candidates) {
+            if (!Files.isRegularFile(p)) {
+                continue;
+            }
+            try {
+                return Files.readString(p, StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                // 次の候補へ
+            }
+        }
+        return null;
+    }
+
+    private String defaultSchemaForProduct(String dbProduct) {
+        if (dbProduct == null) {
+            return null;
+        }
+        if ("H2 Database".equals(dbProduct)) {
+            return "PUBLIC";
+        }
+        return null;
+    }
+
+    /**
+     * Spring Data の Repository インターフェースから第1型引数（エンティティ）を推定する。
+     */
+    private Optional<ClassMeta> resolveEntityMetaForRepository(
+        ClassMeta repositoryMeta,
+        ClassMetaIndex metaIndex,
+        Map<String, String> classFilePaths,
+        String projectRootPath) {
+        if (repositoryMeta == null || classFilePaths == null || projectRootPath == null) {
+            return Optional.empty();
+        }
+        String rel = classFilePaths.get(repositoryMeta.fqn());
+        if (rel == null || rel.isBlank()) {
+            return Optional.empty();
+        }
+        Path path = Paths.get(projectRootPath).resolve(rel);
+        if (!Files.isRegularFile(path)) {
+            return Optional.empty();
+        }
+        try {
+            JavaParser parser = new JavaParser();
+            CompilationUnit cu = parser.parse(path).getResult().orElse(null);
+            if (cu == null) {
+                return Optional.empty();
+            }
+            Optional<ClassOrInterfaceDeclaration> declOpt = cu.findFirst(ClassOrInterfaceDeclaration.class,
+                d -> d.getNameAsString().equals(repositoryMeta.simpleName()));
+            if (declOpt.isEmpty()) {
+                return Optional.empty();
+            }
+            ClassOrInterfaceDeclaration decl = declOpt.get();
+            Optional<String> entitySimple = extractRepositoryEntitySimpleName(decl);
+            if (entitySimple.isEmpty()) {
+                return Optional.empty();
+            }
+            return metaIndex.findBySimpleName(entitySimple.get());
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    private Optional<String> extractRepositoryEntitySimpleName(ClassOrInterfaceDeclaration decl) {
+        NodeList<ClassOrInterfaceType> impls = decl.getImplementedTypes();
+        for (ClassOrInterfaceType impl : impls) {
+            Optional<NodeList<Type>> typeArgsOpt = impl.getTypeArguments();
+            if (typeArgsOpt.isEmpty() || typeArgsOpt.get().isEmpty()) {
+                continue;
+            }
+            String implName = impl.getNameAsString();
+            if (!isSpringDataRepositoryTypeName(implName)) {
+                continue;
+            }
+            String rawEntity = typeArgsOpt.get().get(0).asString();
+            String entitySimple = normalizeTypeName(rawEntity);
+            if (!entitySimple.isBlank()) {
+                return Optional.of(entitySimple);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private boolean isSpringDataRepositoryTypeName(String simpleName) {
+        if (simpleName == null) {
+            return false;
+        }
+        return simpleName.equals("JpaRepository")
+            || simpleName.equals("CrudRepository")
+            || simpleName.equals("PagingAndSortingRepository")
+            || simpleName.equals("ListCrudRepository")
+            || simpleName.equals("ListPagingAndSortingRepository")
+            || simpleName.equals("JpaSpecificationExecutor");
+    }
+
+    private static final Pattern JPQL_FROM_PATTERN = Pattern.compile("(?is)\\bfrom\\s+([A-Za-z_][A-Za-z0-9_]*)");
+
+    private Optional<String> extractJpqlFromRoot(String jpql) {
+        if (jpql == null || jpql.isBlank()) {
+            return Optional.empty();
+        }
+        Matcher m = JPQL_FROM_PATTERN.matcher(jpql);
+        if (m.find()) {
+            return Optional.of(m.group(1));
+        }
+        return Optional.empty();
+    }
+
+    private static final Pattern SQL_FROM_PATTERN = Pattern.compile(
+        "(?is)\\bfrom\\s+([`\"\\[]?)([A-Za-z0-9_]+)\\1");
+
+    private Optional<String> extractSqlFromTable(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return Optional.empty();
+        }
+        Matcher m = SQL_FROM_PATTERN.matcher(sql);
+        if (m.find()) {
+            return Optional.of(m.group(2));
+        }
+        return Optional.empty();
     }
 
     private boolean isSessionCall(
@@ -974,6 +1327,28 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
         return types;
     }
 
+    /**
+     * 同一メソッド内の {@link MethodCallExpr} を、ソース上の出現順（行・列の昇順）に並べる。
+     * {@code findAll} の列挙順には依存しない（P0）。
+     */
+    private List<MethodCallExpr> collectMethodCallsInSourceOrder(MethodDeclaration methodDecl) {
+        List<MethodCallExpr> calls = methodDecl.findAll(MethodCallExpr.class);
+        calls.sort(methodCallSourceOrderComparator());
+        return calls;
+    }
+
+    private static Comparator<MethodCallExpr> methodCallSourceOrderComparator() {
+        return Comparator
+            .comparingInt((MethodCallExpr e) -> e.getBegin().map(p -> p.line).orElse(Integer.MAX_VALUE))
+            .thenComparingInt(e -> e.getBegin().map(p -> p.column).orElse(0));
+    }
+
+    private List<MethodCallExpr> sortMethodCallsBySourceOrder(List<MethodCallExpr> calls) {
+        List<MethodCallExpr> copy = new ArrayList<>(calls);
+        copy.sort(methodCallSourceOrderComparator());
+        return copy;
+    }
+
     private List<FlowDto> buildFlowStepsFromNode(
         Node node,
         ClassMeta currentMeta,
@@ -981,7 +1356,7 @@ public class SequenceSliceServiceImpl implements SequenceSliceService {
         Map<String, ParticipantDto> participants) {
         List<FlowDto> steps = new ArrayList<>();
         String fromId = resolveParticipantId(currentMeta, metaIndex);
-        for (MethodCallExpr callExpr : node.findAll(MethodCallExpr.class)) {
+        for (MethodCallExpr callExpr : sortMethodCallsBySourceOrder(node.findAll(MethodCallExpr.class))) {
             Optional<ClassMeta> targetMetaOpt = resolveTargetClass(callExpr, currentMeta, metaIndex);
             if (targetMetaOpt.isEmpty()) {
                 continue;

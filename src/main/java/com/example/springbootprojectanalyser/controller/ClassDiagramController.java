@@ -9,6 +9,7 @@ import com.example.springbootprojectanalyser.repository.EndpointRepository;
 import com.example.springbootprojectanalyser.repository.ProjectRepository;
 import com.example.springbootprojectanalyser.service.ClassDiagramService;
 import com.example.springbootprojectanalyser.service.EndpointExtractionService;
+import com.example.springbootprojectanalyser.service.SequenceDiagramMermaidService;
 import com.example.springbootprojectanalyser.service.SequenceSliceService;
 import jakarta.validation.Valid;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -49,18 +50,21 @@ public class ClassDiagramController {
     private final ProjectRepository projectRepository;
     private final EndpointRepository endpointRepository;
     private final SequenceSliceService sequenceSliceService;
+    private final SequenceDiagramMermaidService sequenceDiagramMermaidService;
 
     public ClassDiagramController(
             EndpointExtractionService endpointExtractionService,
             ClassDiagramService classDiagramService,
             ProjectRepository projectRepository,
             EndpointRepository endpointRepository,
-            SequenceSliceService sequenceSliceService) {
+            SequenceSliceService sequenceSliceService,
+            SequenceDiagramMermaidService sequenceDiagramMermaidService) {
         this.endpointExtractionService = endpointExtractionService;
         this.classDiagramService = classDiagramService;
         this.projectRepository = projectRepository;
         this.endpointRepository = endpointRepository;
         this.sequenceSliceService = sequenceSliceService;
+        this.sequenceDiagramMermaidService = sequenceDiagramMermaidService;
     }
 
     @GetMapping({"/classdiagram", "/classdiagram/"})
@@ -170,6 +174,30 @@ public class ClassDiagramController {
             // フォーム情報を作成（プロジェクトパスを保持）
             ClassDiagramForm form = new ClassDiagramForm(project.getRootPath(), 
                 newSelectedEndpointId != null ? newSelectedEndpointId : selectedEndpointId);
+
+            // 選択されたエンドポイント起点のシーケンス図（sequenceDiagram）を生成して画面へ渡す
+            try {
+                EndpointDto endpointDto = new EndpointDto(
+                    selectedEndpoint.getEndpointId(),
+                    selectedEndpoint.getClassEntity() != null ? selectedEndpoint.getClassEntity().getId() : null,
+                    selectedEndpoint.getClassEntity() != null ? selectedEndpoint.getClassEntity().getSimpleName() : "",
+                    selectedEndpoint.getUri(),
+                    selectedEndpoint.getHttpMethod() != null ? selectedEndpoint.getHttpMethod().getId() : null,
+                    selectedEndpoint.getHttpMethod() != null ? selectedEndpoint.getHttpMethod().getMethodName() : ""
+                );
+
+                SequenceInputDto sequenceInput = sequenceSliceService.generateSequenceInput(
+                    classDiagram,
+                    endpointDto,
+                    project.getRootPath()
+                );
+
+                String sequenceDiagramText = sequenceDiagramMermaidService.generateSequenceDiagramText(sequenceInput);
+                redirectAttributes.addFlashAttribute("sequenceDiagramText", sequenceDiagramText);
+            } catch (Exception e) {
+                // シーケンス図生成が失敗してもクラス図は表示する
+                redirectAttributes.addFlashAttribute("sequenceDiagramText", "");
+            }
             
             redirectAttributes.addFlashAttribute("classDiagram", classDiagram);
             redirectAttributes.addFlashAttribute("selectedEndpointId", 
